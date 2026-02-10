@@ -115,6 +115,12 @@ export const contextLengthAtom = atomWithStorage<ContextLengthValue>(
   20,
 )
 
+/** 无限上下文触发阈值（占模型窗口百分比，默认 75） */
+export const infiniteContextThresholdAtom = atomWithStorage<number>(
+  'proma-infinite-context-threshold',
+  75,
+)
+
 /** 并排模式 */
 export const parallelModeAtom = atom<boolean>(false)
 

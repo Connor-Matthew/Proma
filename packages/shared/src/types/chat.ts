@@ -150,6 +150,8 @@ export interface ChatSendInput {
   systemMessage?: string
   /** 上下文长度（轮数），'infinite' 表示全部包含 */
   contextLength?: number | 'infinite'
+  /** infinite 模式下的上下文预算阈值（占模型窗口百分比，10-95） */
+  infiniteContextThreshold?: number
   /** 上下文分隔线对应的消息 ID 列表 */
   contextDividers?: string[]
   /** 文件附件列表 */

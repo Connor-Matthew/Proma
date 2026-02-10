@@ -29,12 +29,18 @@ import {
 } from '@/components/ui/tooltip'
 import {
   selectedModelAtom,
+  currentConversationIdAtom,
+  currentMessagesAtom,
   streamingAtom,
   thinkingEnabledAtom,
   pendingAttachmentsAtom,
+  contextLengthAtom,
+  contextDividersAtom,
+  infiniteContextThresholdAtom,
 } from '@/atoms/chat-atoms'
 import type { PendingAttachment } from '@/atoms/chat-atoms'
 import { cn } from '@/lib/utils'
+import type { Channel, ChatMessage } from '@proma/shared'
 
 interface ChatInputProps {
   /** 发送消息回调 */
@@ -43,6 +49,103 @@ interface ChatInputProps {
   onStop: () => void
   /** 清除上下文回调 */
   onClearContext?: () => void
+}
+
+const DEFAULT_CONTEXT_WINDOW = 128_000
+const MIN_RECENT_ROUNDS = 4
+
+function inferModelContextWindow(modelId: string): number {
+  const id = modelId.toLowerCase()
+
+  if (id.includes('claude')) return 200_000
+  if (id.includes('gpt-4.1') || id.startsWith('o3') || id.startsWith('o4')) return 200_000
+  if (id.includes('gpt-4o') || id.includes('gpt-4') || id.includes('gpt-3.5')) return 128_000
+  if (id.includes('gemini')) return 262_144
+
+  return DEFAULT_CONTEXT_WINDOW
+}
+
+function resolveContextWindow(channels: Channel[], channelId: string, modelId: string): number {
+  const channel = channels.find((c) => c.id === channelId)
+  const configured = channel?.models.find((m) => m.id === modelId)?.contextWindow
+  if (typeof configured === 'number' && Number.isFinite(configured) && configured > 0) {
+    return Math.floor(configured)
+  }
+  return inferModelContextWindow(modelId)
+}
+
+function estimateMessageTokens(msg: ChatMessage): number {
+  const contentTokens = Math.ceil(msg.content.length / 4)
+  const attachmentTokens = msg.attachments ? msg.attachments.length * 64 : 0
+  return contentTokens + attachmentTokens + 12
+}
+
+function estimateDraftTokens(content: string, attachmentCount: number): number {
+  if (!content.trim() && attachmentCount === 0) return 0
+  return Math.ceil(content.length / 4) + attachmentCount * 64 + 12
+}
+
+function applyContextFilters(
+  history: ChatMessage[],
+  contextDividers: string[],
+  contextLength: number | 'infinite',
+): ChatMessage[] {
+  let filtered = [...history]
+
+  if (contextDividers.length > 0) {
+    const lastDividerId = contextDividers[contextDividers.length - 1]
+    const dividerIndex = filtered.findIndex((msg) => msg.id === lastDividerId)
+    if (dividerIndex >= 0) {
+      filtered = filtered.slice(dividerIndex + 1)
+    }
+  }
+
+  if (typeof contextLength === 'number' && contextLength >= 0) {
+    if (contextLength === 0) return []
+    const collected: ChatMessage[] = []
+    let roundCount = 0
+    for (let i = filtered.length - 1; i >= 0; i--) {
+      const msg = filtered[i] as ChatMessage
+      collected.unshift(msg)
+      if (msg.role === 'user') {
+        roundCount++
+        if (roundCount >= contextLength) break
+      }
+    }
+    return collected
+  }
+
+  return filtered
+}
+
+function estimateInfiniteUsedTokens(
+  history: ChatMessage[],
+  contextWindow: number,
+  thresholdPercent: number,
+): number {
+  const ratio = Math.min(95, Math.max(10, Math.round(thresholdPercent)))
+  const budget = Math.max(2048, Math.floor((contextWindow * ratio) / 100))
+  let used = 0
+  let recentRounds = 0
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i] as ChatMessage
+    const estimate = estimateMessageTokens(msg)
+    const shouldStop = used + estimate > budget && recentRounds >= MIN_RECENT_ROUNDS
+    if (shouldStop) break
+    used += estimate
+    if (msg.role === 'user') {
+      recentRounds++
+    }
+  }
+
+  return used
+}
+
+function formatTokens(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`
+  return `${tokens}`
 }
 
 /**
@@ -65,10 +168,17 @@ function fileToBase64(file: File): Promise<string> {
 export function ChatInput({ onSend, onStop, onClearContext }: ChatInputProps): React.ReactElement {
   const [content, setContent] = React.useState('')
   const selectedModel = useAtomValue(selectedModelAtom)
+  const currentConversationId = useAtomValue(currentConversationIdAtom)
+  const currentMessages = useAtomValue(currentMessagesAtom)
   const streaming = useAtomValue(streamingAtom)
   const [thinkingEnabled, setThinkingEnabled] = useAtom(thinkingEnabledAtom)
   const [pendingAttachments, setPendingAttachments] = useAtom(pendingAttachmentsAtom)
+  const contextLength = useAtomValue(contextLengthAtom)
+  const contextDividers = useAtomValue(contextDividersAtom)
+  const infiniteContextThreshold = useAtomValue(infiniteContextThresholdAtom)
   const [isDragOver, setIsDragOver] = React.useState(false)
+  const [channels, setChannels] = React.useState<Channel[]>([])
+  const [historyForEstimate, setHistoryForEstimate] = React.useState<ChatMessage[]>([])
 
   const canSend = (content.trim().length > 0 || pendingAttachments.length > 0)
     && selectedModel !== null
@@ -212,6 +322,48 @@ export function ChatInput({ onSend, onStop, onClearContext }: ChatInputProps): R
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [onClearContext])
 
+  React.useEffect(() => {
+    window.electronAPI.listChannels().then(setChannels).catch(console.error)
+  }, [])
+
+  React.useEffect(() => {
+    if (!currentConversationId) {
+      setHistoryForEstimate([])
+      return
+    }
+
+    window.electronAPI.getConversationMessages(currentConversationId)
+      .then(setHistoryForEstimate)
+      .catch(console.error)
+  }, [currentConversationId, currentMessages.length, streaming])
+
+  const usageDisplay = React.useMemo(() => {
+    if (!selectedModel) return null
+    const contextWindow = resolveContextWindow(channels, selectedModel.channelId, selectedModel.modelId)
+    const filteredHistory = applyContextFilters(historyForEstimate, contextDividers, contextLength)
+    const draftTokens = estimateDraftTokens(content, pendingAttachments.length)
+    const historyTokens = contextLength === 'infinite'
+      ? estimateInfiniteUsedTokens(filteredHistory, contextWindow, infiniteContextThreshold)
+      : filteredHistory.reduce((sum, msg) => sum + estimateMessageTokens(msg), 0)
+    const usedTokens = historyTokens + draftTokens
+    const percent = Math.max(0, Math.round((usedTokens / contextWindow) * 100))
+
+    return {
+      text: `${formatTokens(usedTokens)} / ${formatTokens(contextWindow)}`,
+      tooltip: `当前估算: ${usedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (${percent}%)`,
+      isWarning: percent >= 80,
+    }
+  }, [
+    selectedModel,
+    channels,
+    historyForEstimate,
+    contextDividers,
+    contextLength,
+    content,
+    pendingAttachments.length,
+    infiniteContextThreshold,
+  ])
+
   return (
     <div className="px-2.5 pb-2.5 md:px-[18px] md:pb-[18px] pt-2">
         {/* 卡片式输入容器 — 对标 Cherry Studio: border-radius 17px, 0.5px border */}
@@ -308,6 +460,25 @@ export function ChatInput({ onSend, onStop, onClearContext }: ChatInputProps): R
 
             {/* 右侧：发送 / 停止按钮 */}
             <div className="flex items-center gap-1.5">
+              {usageDisplay && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <div
+                      className={cn(
+                        'rounded-full px-2 py-0.5 text-xs',
+                        usageDisplay.isWarning
+                          ? 'text-amber-600 dark:text-amber-400 bg-amber-500/10'
+                          : 'text-muted-foreground'
+                      )}
+                    >
+                      {usageDisplay.text}
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    <p>{usageDisplay.tooltip}</p>
+                  </TooltipContent>
+                </Tooltip>
+              )}
               {streaming ? (
                 <Button
                   type="button"

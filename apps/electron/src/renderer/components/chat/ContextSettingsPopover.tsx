@@ -1,13 +1,14 @@
 /**
  * ContextSettingsPopover - 上下文长度设置弹出层
  *
- * Popover 内含上下文长度 Slider（0/5/10/15/20/∞ 轮）。
- * 简化版移植自 proma-frontend，去掉 Token 估算部分。
+ * Popover 内含上下文长度 Slider（0/5/10/15/20/∞ 轮），
+ * 以及 infinite 模式的自动压缩阈值（默认 75%）。
  */
 
 import { useState } from 'react'
 import { useAtom } from 'jotai'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import {
   Popover,
   PopoverContent,
@@ -23,6 +24,7 @@ import { cn } from '@/lib/utils'
 import { Settings2 } from 'lucide-react'
 import {
   contextLengthAtom,
+  infiniteContextThresholdAtom,
   CONTEXT_LENGTH_OPTIONS,
   type ContextLengthValue,
 } from '@/atoms/chat-atoms'
@@ -48,17 +50,22 @@ function valueToSliderPosition(value: ContextLengthValue): number {
 export function ContextSettingsPopover(): React.ReactElement {
   const [open, setOpen] = useState(false)
   const [contextLength, setContextLength] = useAtom(contextLengthAtom)
+  const [infiniteThreshold, setInfiniteThreshold] = useAtom(infiniteContextThresholdAtom)
+  const isInfiniteMode = contextLength === 'infinite'
 
   const sliderPosition = valueToSliderPosition(contextLength)
   const maxSliderPosition = CONTEXT_LENGTH_OPTIONS.length - 1
 
   const handleSliderChange = (values: number[]): void => {
     const newValue = sliderPositionToValue(values[0])
-    // 暂不允许选择 infinite
-    if (newValue === 'infinite') {
-      return
-    }
     setContextLength(newValue)
+  }
+
+  const handleThresholdChange = (value: string): void => {
+    const parsed = Number.parseInt(value, 10)
+    if (!Number.isFinite(parsed)) return
+    const clamped = Math.min(95, Math.max(10, parsed))
+    setInfiniteThreshold(clamped)
   }
 
   return (
@@ -109,9 +116,31 @@ export function ContextSettingsPopover(): React.ReactElement {
             </div>
 
             {/* 无限上下文提示 */}
-            <p className="text-[10px] text-muted-foreground">
-              ∞ 无限上下文（即将推出）
-            </p>
+            <div className="space-y-2 pt-1">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-muted-foreground">
+                  ∞ 自动压缩阈值
+                </span>
+                <div className="flex items-center gap-1">
+                  <Input
+                    type="number"
+                    min={10}
+                    max={95}
+                    value={infiniteThreshold}
+                    onChange={(e) => handleThresholdChange(e.target.value)}
+                    disabled={!isInfiniteMode}
+                    className={cn(
+                      'h-6 w-14 px-2 text-center text-xs',
+                      !isInfiniteMode && 'opacity-60 cursor-not-allowed'
+                    )}
+                  />
+                  <span className="text-[10px] text-muted-foreground">%</span>
+                </div>
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                ∞ 模式下按窗口比例保留最近原文，其余历史自动压缩
+              </p>
+            </div>
           </div>
         </div>
       </PopoverContent>

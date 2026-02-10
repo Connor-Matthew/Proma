@@ -14,7 +14,7 @@
 import { randomUUID } from 'node:crypto'
 import type { WebContents } from 'electron'
 import { CHAT_IPC_CHANNELS } from '@proma/shared'
-import type { ChatSendInput, ChatMessage, GenerateTitleInput, FileAttachment } from '@proma/shared'
+import type { ChatSendInput, ChatMessage, GenerateTitleInput, FileAttachment, Channel } from '@proma/shared'
 import {
   getAdapter,
   streamSSE,
@@ -25,6 +25,7 @@ import { listChannels, decryptApiKey } from './channel-manager'
 import { appendMessage, updateConversationMeta, getConversationMessages } from './conversation-manager'
 import { readAttachmentAsBase64, isImageAttachment } from './attachment-service'
 import { extractTextFromAttachment, isDocumentAttachment } from './document-parser'
+import { getModelContextWindow } from './model-context-window-cache'
 
 /** 活跃的 AbortController 映射（conversationId → controller） */
 const activeControllers = new Map<string, AbortController>()
@@ -119,6 +120,89 @@ async function enrichHistoryWithDocuments(
 
 // ===== 上下文过滤 =====
 
+const DEFAULT_INFINITE_THRESHOLD = 75
+const MIN_INFINITE_THRESHOLD = 10
+const MAX_INFINITE_THRESHOLD = 95
+const DEFAULT_CONTEXT_WINDOW = 128_000
+const MIN_RECENT_ROUNDS = 4
+
+interface ContextPreparationResult {
+  history: ChatMessage[]
+  systemMessage: string | undefined
+}
+
+function clampInfiniteThreshold(value?: number): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return DEFAULT_INFINITE_THRESHOLD
+  }
+  return Math.min(MAX_INFINITE_THRESHOLD, Math.max(MIN_INFINITE_THRESHOLD, Math.round(value)))
+}
+
+function inferModelContextWindow(modelId: string): number {
+  const id = modelId.toLowerCase()
+
+  if (id.includes('claude')) return 200_000
+  if (id.includes('gpt-4.1') || id.startsWith('o3') || id.startsWith('o4')) return 200_000
+  if (id.includes('gpt-4o') || id.includes('gpt-4') || id.includes('gpt-3.5')) return 128_000
+  if (id.includes('gemini')) return 262_144
+
+  return DEFAULT_CONTEXT_WINDOW
+}
+
+function readConfiguredContextWindow(channel: Channel, modelId: string): number | undefined {
+  const target = modelId.toLowerCase()
+  const configured = channel.models.find((m) => m.id.toLowerCase() === target)?.contextWindow
+  if (typeof configured === 'number' && Number.isFinite(configured) && configured > 0) {
+    return Math.floor(configured)
+  }
+  return undefined
+}
+
+function resolveContextWindow(channel: Channel, modelId: string): number {
+  const configured = readConfiguredContextWindow(channel, modelId)
+  if (configured) return configured
+
+  const cached = getModelContextWindow(modelId)
+  if (cached) return cached
+
+  return inferModelContextWindow(modelId)
+}
+
+function estimateMessageTokens(msg: ChatMessage): number {
+  const contentTokens = Math.ceil(msg.content.length / 4)
+  const attachmentTokens = msg.attachments ? msg.attachments.length * 64 : 0
+  return contentTokens + attachmentTokens + 12
+}
+
+function truncateText(text: string, maxLength: number): string {
+  const compact = text.replace(/\s+/g, ' ').trim()
+  if (compact.length <= maxLength) return compact
+  return `${compact.slice(0, maxLength)}...`
+}
+
+function buildCompressedHistorySummary(messages: ChatMessage[]): string {
+  if (messages.length === 0) return ''
+
+  const maxItems = 16
+  const startIndex = Math.max(0, messages.length - maxItems)
+  const selected = messages.slice(startIndex)
+  const lines: string[] = []
+
+  for (const msg of selected) {
+    const roleLabel = msg.role === 'assistant' ? '助手' : msg.role === 'user' ? '用户' : '系统'
+    const excerpt = truncateText(msg.content, msg.role === 'user' ? 180 : 140)
+    const attachmentHint = msg.attachments?.length
+      ? `（附件 ${msg.attachments.length} 个）`
+      : ''
+    lines.push(`- ${roleLabel}${attachmentHint}: ${excerpt}`)
+  }
+
+  return [
+    `更早历史共 ${messages.length} 条，以下为关键摘录：`,
+    ...lines,
+  ].join('\n')
+}
+
 /**
  * 根据分隔线和上下文长度裁剪历史消息
  *
@@ -167,6 +251,63 @@ function filterHistory(
   return filtered
 }
 
+/**
+ * infinite 模式下自动压缩上下文：
+ * - 按模型窗口的阈值比例保留最近原文
+ * - 将更早历史压缩为 system 摘要
+ */
+function prepareInfiniteContext(
+  history: ChatMessage[],
+  contextWindow: number,
+  systemMessage: string | undefined,
+  thresholdPercent?: number,
+): ContextPreparationResult {
+  if (history.length === 0) {
+    return { history, systemMessage }
+  }
+
+  const ratio = clampInfiniteThreshold(thresholdPercent)
+  const historyBudget = Math.max(2048, Math.floor((contextWindow * ratio) / 100))
+
+  const recent: ChatMessage[] = []
+  let usedTokens = 0
+  let recentRounds = 0
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i] as ChatMessage
+    const estimated = estimateMessageTokens(msg)
+    const shouldStop = usedTokens + estimated > historyBudget && recentRounds >= MIN_RECENT_ROUNDS
+    if (shouldStop) break
+
+    recent.unshift(msg)
+    usedTokens += estimated
+    if (msg.role === 'user') {
+      recentRounds++
+    }
+  }
+
+  if (recent.length >= history.length) {
+    return { history, systemMessage }
+  }
+
+  const older = history.slice(0, history.length - recent.length)
+  const compressedSummary = buildCompressedHistorySummary(older)
+  if (!compressedSummary) {
+    return { history: recent, systemMessage }
+  }
+
+  const autoSummary = [
+    '【自动上下文摘要】',
+    compressedSummary,
+    '请优先以最近原文消息为准；若摘要与原文冲突，以原文为准。',
+  ].join('\n')
+
+  return {
+    history: recent,
+    systemMessage: systemMessage ? `${systemMessage}\n\n${autoSummary}` : autoSummary,
+  }
+}
+
 // ===== 核心流式函数 =====
 
 /**
@@ -182,6 +323,7 @@ export async function sendMessage(
   const {
     conversationId, userMessage, channelId,
     modelId, systemMessage, contextLength, contextDividers, attachments,
+    infiniteContextThreshold,
     thinkingEnabled,
   } = input
 
@@ -221,9 +363,13 @@ export async function sendMessage(
   // 4. 从磁盘读取完整消息历史（不依赖前端传入，确保上下文完整）
   const fullHistory = getConversationMessages(conversationId)
   const filteredHistory = filterHistory(fullHistory, contextDividers, contextLength)
+  const resolvedContextWindow = resolveContextWindow(channel, modelId)
+  const preparedContext = contextLength === 'infinite'
+    ? prepareInfiniteContext(filteredHistory, resolvedContextWindow, systemMessage, infiniteContextThreshold)
+    : { history: filteredHistory, systemMessage }
 
   // 5. 提取文档附件文本，注入到消息内容中
-  const enrichedHistory = await enrichHistoryWithDocuments(filteredHistory)
+  const enrichedHistory = await enrichHistoryWithDocuments(preparedContext.history)
   const enrichedUserMessage = await enrichMessageWithDocuments(userMessage, attachments)
 
   // 6. 创建 AbortController
@@ -243,7 +389,7 @@ export async function sendMessage(
       modelId,
       history: enrichedHistory,
       userMessage: enrichedUserMessage,
-      systemMessage,
+      systemMessage: preparedContext.systemMessage,
       attachments,
       readImageAttachments: getImageAttachmentData,
       thinkingEnabled,

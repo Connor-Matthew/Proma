@@ -60,6 +60,8 @@ export interface ChannelModel {
   id: string
   /** 模型显示名称 */
   name: string
+  /** 上下文窗口（token），可选 */
+  contextWindow?: number
   /** 是否启用 */
   enabled: boolean
 }

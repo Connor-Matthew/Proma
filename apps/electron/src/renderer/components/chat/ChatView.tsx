@@ -6,7 +6,7 @@
  * - 订阅流式 IPC 事件（chunk, reasoning, complete, error）
  * - 管理 streaming 状态和累积内容
  * - 处理消息删除、上下文清除/删除
- * - 传递 contextLength 和 contextDividers 到 sendMessage
+ * - 传递 contextLength / infiniteThreshold / contextDividers 到 sendMessage
  * - 无当前对话时显示引导文案
  *
  * 布局：三段式 ChatHeader | ChatMessages | ChatInput
@@ -26,6 +26,7 @@ import {
   selectedModelAtom,
   conversationsAtom,
   contextLengthAtom,
+  infiniteContextThresholdAtom,
   contextDividersAtom,
   thinkingEnabledAtom,
   pendingAttachmentsAtom,
@@ -54,6 +55,7 @@ export function ChatView(): React.ReactElement {
   const [selectedModel, setSelectedModel] = useAtom(selectedModelAtom)
   const setConversations = useSetAtom(conversationsAtom)
   const contextLength = useAtomValue(contextLengthAtom)
+  const infiniteContextThreshold = useAtomValue(infiniteContextThresholdAtom)
   const [contextDividers, setContextDividers] = useAtom(contextDividersAtom)
   const thinkingEnabled = useAtomValue(thinkingEnabledAtom)
   const [pendingAttachments, setPendingAttachments] = useAtom(pendingAttachmentsAtom)
@@ -298,7 +300,8 @@ export function ChatView(): React.ReactElement {
       channelId: selectedModel.channelId,
       modelId: selectedModel.modelId,
       contextLength,
-      contextDividers,
+      infiniteContextThreshold,
+      contextDividers: options?.contextDividersOverride ?? contextDividers,
       attachments: savedAttachments.length > 0 ? savedAttachments : undefined,
       thinkingEnabled: thinkingEnabled || undefined,
     }

@@ -39,6 +39,7 @@ import { getAgentWorkspacePath, getAgentSessionWorkspacePath } from './config-pa
 import { getRuntimeStatus } from './runtime-init'
 import { getWorkspaceMcpConfig, ensurePluginManifest } from './agent-workspace-manager'
 import { buildSystemPromptAppend, buildDynamicContext } from './agent-prompt-builder'
+import { setModelContextWindow } from './model-context-window-cache'
 
 /** 活跃的 AbortController 映射（sessionId → controller） */
 const activeControllers = new Map<string, AbortController>()
@@ -756,11 +757,14 @@ export async function runAgent(
       // 从 result 消息中缓存 contextWindow（参考 craft-agents-oss）
       if (msg.type === 'result') {
         const resultMsg = msg as SDKResultMessage
-        const modelUsageEntries = Object.values(resultMsg.modelUsage || {})
-        const primaryModelUsage = modelUsageEntries[0]
-        if (primaryModelUsage?.contextWindow) {
-          cachedContextWindow = primaryModelUsage.contextWindow
-          console.log(`[Agent 服务] 缓存 contextWindow: ${cachedContextWindow}`)
+        const modelUsageEntries = Object.entries(resultMsg.modelUsage || {})
+        for (const [usageModelId, usage] of modelUsageEntries) {
+          if (!usage?.contextWindow) continue
+          cachedContextWindow = usage.contextWindow
+          setModelContextWindow(usageModelId, usage.contextWindow)
+          // 同步缓存 resolvedModel，避免 SDK usage key 与 modelId 命名不一致时 chat 无法命中
+          setModelContextWindow(resolvedModel, usage.contextWindow)
+          console.log(`[Agent 服务] 缓存 contextWindow: ${usageModelId} -> ${usage.contextWindow}`)
         }
       }
 

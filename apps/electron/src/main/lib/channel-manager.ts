@@ -436,6 +436,21 @@ interface AnthropicModelItem {
   id: string
   display_name?: string
   type?: string
+  context_window?: number
+  max_input_tokens?: number
+}
+
+function parsePositiveInt(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return Math.floor(value)
+  }
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value, 10)
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed
+    }
+  }
+  return undefined
 }
 
 /**
@@ -472,6 +487,7 @@ async function fetchAnthropicModels(baseUrl: string, apiKey: string): Promise<Fe
   const models: ChannelModel[] = items.map((item) => ({
     id: item.id,
     name: item.display_name || item.id,
+    contextWindow: parsePositiveInt(item.context_window) ?? parsePositiveInt(item.max_input_tokens),
     enabled: true,
   }))
 
@@ -488,6 +504,10 @@ async function fetchAnthropicModels(baseUrl: string, apiKey: string): Promise<Fe
 interface OpenAIModelItem {
   id: string
   owned_by?: string
+  context_window?: number
+  context_length?: number
+  max_context_tokens?: number
+  input_token_limit?: number
 }
 
 /**
@@ -521,6 +541,10 @@ async function fetchOpenAICompatibleModels(baseUrl: string, apiKey: string): Pro
   const models: ChannelModel[] = items.map((item) => ({
     id: item.id,
     name: item.id,
+    contextWindow: parsePositiveInt(item.context_window)
+      ?? parsePositiveInt(item.context_length)
+      ?? parsePositiveInt(item.max_context_tokens)
+      ?? parsePositiveInt(item.input_token_limit),
     enabled: true,
   }))
 
@@ -542,6 +566,7 @@ interface GoogleModelItem {
   displayName?: string
   description?: string
   supportedGenerationMethods?: string[]
+  inputTokenLimit?: number | string
 }
 
 /**
@@ -580,6 +605,7 @@ async function fetchGoogleModels(baseUrl: string, apiKey: string): Promise<Fetch
     return {
       id,
       name: item.displayName || id,
+      contextWindow: parsePositiveInt(item.inputTokenLimit),
       enabled: true,
     }
   })
